@@ -22,11 +22,9 @@ new file mode 100644
 --- /dev/null
 +++ b/OPENVTS-README.md
 @@ -0,0 +1,55 @@
-+# Open VTS Terminal — direct LLM source candidate
++# Open VTS Terminal — your own LLM API
 +
-+**Delivery status: updated source only. No compiled OpenVTSTerminal.exe or tested Windows distribution is included.**
-+
-+The original temporary build environment was lost before its work was saved. These changes were reconstructed from the original uploaded source. The replacement Rust toolchain download was blocked by the execution environment's network policy. Therefore these reconstructed changes have not been compiled, formatted with rustfmt, or run on Windows. The 13 tests mentioned during the earlier attempt do not validate this reconstructed version. Six targeted Rust tests are included and must pass before building a release.
++A modified Warp client for Windows x64, configured for the Open VTS Qwen API. Download the completed Windows artifact from the fork’s **Build Open VTS Windows installer** workflow. `OpenVTSTerminalSetup.exe` is the installer; a source archive by itself does not contain a compiled application.
 +
 +## API configuration
 +
@@ -66,9 +64,11 @@ new file mode 100644
 +- The supplied source is Warp's open-source client. Its hosted orchestration service is not in the upload. Cloud agents/Oz, Warp Drive, collaboration, hosted indexing and other hosted features are not reproduced. Hosted service roots are disabled for this binary. Some original Warp UI and branding remain.
 +- This candidate supports JSON responses, normal prompts, shell-command tool-result cycles and a single root task. Streaming/SSE, specialized file tools, multiple agent tasks and all hosted message variants are not implemented. Unsupported history/input fails explicitly; start a new conversation.
 +
-+## Validation still required
++## Validation and limitations
 +
-+The archive's TOML and JSON files were parsed and the source changes were checked against the supplied archive. That is not compilation or a GUI test. The six adapter tests, full Windows build, startup/login-free Agent Mode flow, tool approval/cancellation, runtime resource loading and a live request to your authenticated API remain unverified. Do not treat this source candidate as a production-ready release.
++The build script runs the adapter tests, including a local HTTP test of the API request and native shell-tool response, and Clippy before compiling the desktop application. A successfully published workflow artifact has also passed a silent installation and settings-schema generation from the installed executable. The exact results are recorded in the GitHub Actions run; a pending or failed run has no verified installer.
++
++A real Windows GPU session, interactive shell approval/cancellation, and a request using your actual API token still require verification on your machine. No actual token was supplied for testing. This is an unsigned custom build, not a production-certified release.
 +
 +Original AGPL/MIT licenses and third-party notices are retained. This is a modified client, not an official Warp distribution.
 +
@@ -76,7 +76,7 @@ new file mode 100644
 +
 +`.github/workflows/openvts-windows.yml` prepares a Windows Server 2022 runner, runs the targeted adapter tests and Clippy, compiles the application, creates an Inno Setup installer, and checks a silent installation plus settings-schema generation from the installed binary. It uploads completed installer/portable artifacts only after those checks pass. A real GPU session and a live authenticated LLM request still need verification.
 +
-+The workflow has a 30-minute job limit; its build subprocess is stopped after 23 minutes so logs can still be uploaded. Compilation caches are retained when possible. No LLM token or signing certificate is required to build. The workflow has been prepared but has not been run: no target repository or Windows runner has been supplied. It can be started manually from the repository's Actions tab or by a pull request containing these changes. It creates workflow artifacts, not a public release.
++The workflow has a 30-minute job limit; its build subprocess is stopped after 23 minutes so logs can still be uploaded. Compilation caches are retained when possible. No LLM token or signing certificate is required to build. The build recipe is in `fleetstack2011/openvts-terminal`. Its bootstrap workflow checks out the exact uploaded Warp revision and applies `openvts-custom-llm.patch`. The resulting source ZIP contains the actual modified files. The standalone workflow in this source ZIP can be started from the Actions tab after committing this source to a repository. It creates workflow artifacts, not a public release.
 diff --git a/app/Cargo.toml b/app/Cargo.toml
 --- a/app/Cargo.toml
 +++ b/app/Cargo.toml
@@ -379,7 +379,7 @@ diff --git a/openvts/adapter/Cargo.toml b/openvts/adapter/Cargo.toml
 new file mode 100644
 --- /dev/null
 +++ b/openvts/adapter/Cargo.toml
-@@ -0,0 +1,19 @@
+@@ -0,0 +1,22 @@
 +[package]
 +name = "openvts_llm"
 +version = "0.1.0"
@@ -399,11 +399,14 @@ new file mode 100644
 +serde_json = "1"
 +uuid = { version = "1", features = ["v4"] }
 +warp_multi_agent_api = { git = "https://github.com/warpdotdev/warp-proto-apis.git", rev = "f5c1878026bc11f429260c5e798e7bab6ed4e118" }
++
++[dev-dependencies]
++tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 diff --git a/openvts/adapter/src/lib.rs b/openvts/adapter/src/lib.rs
 new file mode 100644
 --- /dev/null
 +++ b/openvts/adapter/src/lib.rs
-@@ -0,0 +1,307 @@
+@@ -0,0 +1,310 @@
 +use std::collections::HashSet;
 +use std::time::Duration;
 +
@@ -690,7 +693,7 @@ new file mode 100644
 +        bytes.extend_from_slice(&chunk);
 +    }
 +    let value = serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("Expected a JSON Chat Completions response; stream=false"))?;
-+    let (output, has_tools, truncated) = decode_response(value, &prepared, &request_id)?;
++    let (output, _, truncated) = decode_response(value, &prepared, &request_id)?;
 +    let conversation_id = request.metadata.as_ref().map(|m| m.conversation_id.clone())
 +        .filter(|s| !s.is_empty()).unwrap_or_else(id);
 +    let mut events = vec![from_json(json!({"init":{"conversationId":conversation_id,"requestId":request_id,"runId":id()}}))?];
@@ -701,7 +704,10 @@ new file mode 100644
 +    let messages: Result<Vec<_>> = prepared.echoes.iter().chain(output.iter()).map(to_json).collect();
 +    events.push(action(json!({"addMessagesToTask":{"taskId":prepared.task_id,"messages":messages?}}))?);
 +    events.push(action(json!({"commitTransaction":{}}))?);
-+    let reason = if has_tools { "other" } else if truncated { "maxTokenLimit" } else { "done" };
++    // Native Warp treats `other` as a failed stream, including after a tool call.
++    // A completed response is successful; the client executes approved tools and
++    // sends their results in its next request.
++    let reason = if truncated { "maxTokenLimit" } else { "done" };
 +    let mut finished = json!({});
 +    finished[reason] = json!({});
 +    events.push(from_json(json!({"finished":finished}))?);
@@ -715,7 +721,7 @@ diff --git a/openvts/adapter/src/lib_tests.rs b/openvts/adapter/src/lib_tests.rs
 new file mode 100644
 --- /dev/null
 +++ b/openvts/adapter/src/lib_tests.rs
-@@ -0,0 +1,65 @@
+@@ -0,0 +1,135 @@
 +use super::*;
 +
 +fn request() -> api::Request {
@@ -781,11 +787,81 @@ new file mode 100644
 +    assert!(action(json!({"commitTransaction":{}})).is_ok());
 +    assert!(from_json::<api::ResponseEvent>(json!({"finished":{"done":{}}})).is_ok());
 +}
++
++#[tokio::test]
++async fn http_tool_response_completes_successfully_and_preserves_the_wire_request() {
++    use std::io::{BufRead, BufReader, Read, Write};
++    use std::net::TcpListener;
++
++    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
++    listener.set_nonblocking(true).unwrap();
++    let endpoint = format!("http://{}/v1/chat/completions", listener.local_addr().unwrap());
++    let server = std::thread::spawn(move || {
++        let deadline = std::time::Instant::now() + Duration::from_secs(10);
++        let mut socket = loop {
++            match listener.accept() {
++                Ok((socket, _)) => break socket,
++                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
++                    assert!(std::time::Instant::now() < deadline, "No test request received");
++                    std::thread::sleep(Duration::from_millis(10));
++                }
++                Err(error) => panic!("Test listener failed: {error}"),
++            }
++        };
++        socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
++        socket.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
++        let mut reader = BufReader::new(socket.try_clone().unwrap());
++        let mut headers = String::new();
++        loop {
++            let mut line = String::new();
++            assert!(reader.read_line(&mut line).unwrap() > 0);
++            if line == "\r\n" { break; }
++            headers.push_str(&line);
++        }
++        assert!(headers.starts_with("POST /v1/chat/completions HTTP/1.1\r\n"));
++        assert!(headers.to_ascii_lowercase().contains("authorization: bearer local-test-token\r\n"));
++        let length: usize = headers.lines().find_map(|line| {
++            let (name, value) = line.split_once(':')?;
++            name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse().unwrap())
++        }).unwrap();
++        let mut body = vec![0; length];
++        reader.read_exact(&mut body).unwrap();
++        let request: Value = serde_json::from_slice(&body).unwrap();
++        assert_eq!(request["model"], DEFAULT_MODEL);
++        assert_eq!(request["messages"][1]["content"], "Hello");
++        assert_eq!(request["chat_template_kwargs"]["enable_thinking"], true);
++        assert_eq!(request["max_tokens"], 131000);
++        assert_eq!(request["temperature"], 0.1);
++        assert_eq!(request["tools"][0]["function"]["name"], "run_shell_command");
++        let response = json!({"choices":[{"finish_reason":"tool_calls","message":{
++            "content":null,"tool_calls":[{"id":"call-1","type":"function","function":{
++                "name":"run_shell_command","arguments":"{\"command\":\"Get-Location\"}"
++            }}]
++        }}]}).to_string();
++        write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
++    });
++    let mut native_request = request();
++    native_request.settings = Some(api::request::Settings {
++        supported_tools: vec![api::ToolType::RunShellCommand as i32],
++        ..Default::default()
++    });
++    let result = generate(native_request, Config { endpoint, timeout_seconds: 5, ..Config::default() }, "local-test-token".into()).await;
++    server.join().unwrap();
++    let events = result.unwrap();
++    let finish = to_json(events.last().unwrap()).unwrap();
++    assert_eq!(finish["finished"]["done"], json!({}));
++    assert!(finish["finished"].get("other").is_none());
++    let additions = events.iter().map(|event| to_json(event).unwrap()).find(|event|
++        event.pointer("/clientActions/actions/0/addMessagesToTask").is_some()).unwrap();
++    let shell = &additions["clientActions"]["actions"][0]["addMessagesToTask"]["messages"][1]["toolCall"]["runShellCommand"];
++    assert_eq!(shell["command"], "Get-Location");
++    assert_eq!(shell["isRisky"], true);
++}
 diff --git a/openvts/build-windows.ps1 b/openvts/build-windows.ps1
 new file mode 100644
 --- /dev/null
 +++ b/openvts/build-windows.ps1
-@@ -0,0 +1,20 @@
+@@ -0,0 +1,22 @@
 +param(
 +    [ValidateRange(1, 30)][int]$TimeoutMinutes = 30,
 +    [switch]$Installer
@@ -805,12 +881,14 @@ new file mode 100644
 +    throw "Build stopped after $TimeoutMinutes minutes. Check dist for any earlier completed files; this run did not complete. Cached compilation can be reused on a later run."
 +}
 +$process.WaitForExit()
++Get-Content (Join-Path $logs 'stdout.log') -Tail 80 -ErrorAction SilentlyContinue
++Get-Content (Join-Path $logs 'stderr.log') -Tail 100 -ErrorAction SilentlyContinue
 +if ($process.ExitCode -ne 0) { throw "Build failed with exit code $($process.ExitCode). See build-logs." }
 diff --git a/openvts/build-worker.ps1 b/openvts/build-worker.ps1
 new file mode 100644
 --- /dev/null
 +++ b/openvts/build-worker.ps1
-@@ -0,0 +1,58 @@
+@@ -0,0 +1,61 @@
 +param([switch]$Installer)
 +$ErrorActionPreference = 'Stop'
 +Set-Location (Split-Path $PSScriptRoot -Parent)
@@ -838,6 +916,9 @@ new file mode 100644
 +Run 'cargo' @('test', '--manifest-path', 'openvts/adapter/Cargo.toml', '--jobs', '2')
 +Run 'cargo' @('clippy', '--manifest-path', 'openvts/adapter/Cargo.toml', '--all-targets', '--', '-D', 'warnings')
 +Run 'cargo' @('build', '--release', '-p', 'warp', '--bin', 'openvts', '--features', 'openvts,gui,release_bundle', '--target', 'x86_64-pc-windows-msvc', '--jobs', '2')
++Run 'cargo' @('fmt', '--package', 'warp')
++Run 'cargo' @('fmt', '--manifest-path', 'openvts/adapter/Cargo.toml')
++@("Build UTC: $([DateTime]::UtcNow.ToString('o'))", 'Adapter tests: passed', 'Adapter Clippy: passed', 'Windows x64 release compilation: passed', 'Rust formatting: completed', 'Interactive Windows GUI and authenticated LLM request: not verified by this build') | Set-Content 'openvts/VALIDATION.txt'
 +if (-not (Get-Command 'cargo-about' -ErrorAction SilentlyContinue)) { Run 'cargo' @('install', '--locked', 'cargo-about', '--version', '0.8.4') }
 +$binary = Join-Path (Get-Location) 'target\x86_64-pc-windows-msvc\release\openvts.exe'
 +if (-not (Test-Path $binary)) { throw 'No executable was produced.' }
@@ -852,12 +933,12 @@ new file mode 100644
 +New-Item -ItemType Directory -Force -Path (Join-Path $stage 'x64') | Out-Null
 +Copy-Item 'app\assets\windows\x64\OpenConsole.exe' (Join-Path $stage 'x64')
 +Copy-Item 'app\assets\bundled\bootstrap\pwsh.ps1' $stage
-+$env:SETTINGS_SCHEMA_EXECUTABLE = $binary
++$env:SETTINGS_SCHEMA_EXECUTABLE = Join-Path $stage 'OpenVTSTerminal.exe'
 +Remove-Item Env:SETTINGS_SCHEMA_SOURCE -ErrorAction SilentlyContinue
 +Remove-Item Env:SKIP_SETTINGS_SCHEMA -ErrorAction SilentlyContinue
 +& 'script\windows\prepare_bundled_resources.ps1' -DestinationDir (Join-Path $stage 'resources') -Channel 'oss'
 +if (-not $?) { throw 'Resource packaging failed.' }
-+Copy-Item 'openvts\openvts-llm.json', 'openvts\Start-OpenVTS.cmd', 'openvts\Start-OpenVTS.ps1', 'OPENVTS-README.md', 'LICENSE-AGPL', 'LICENSE-MIT' $stage
++Copy-Item 'openvts\openvts-llm.json', 'openvts\Start-OpenVTS.cmd', 'openvts\Start-OpenVTS.ps1', 'openvts\VALIDATION.txt', 'OPENVTS-README.md', 'LICENSE-AGPL', 'LICENSE-MIT' $stage
 +Get-ChildItem $stage -Recurse -File | Get-FileHash -Algorithm SHA256 | ForEach-Object { "$($_.Hash)  $($_.Path.Substring($stage.Length + 1))" } | Set-Content (Join-Path $stage 'SHA256SUMS.txt')
 +Compress-Archive -Path $stage -DestinationPath "$stage.zip"
 +Write-Host "Created $stage.zip"
