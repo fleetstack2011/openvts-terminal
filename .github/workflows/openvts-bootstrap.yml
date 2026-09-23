@@ -1,0 +1,127 @@
+name: Build Open VTS Windows installer
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: openvts-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  installer:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: source
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_TERM_COLOR: never
+      LIBCLANG_PATH: 'C:\Program Files\LLVM\bin'
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          path: recipe
+          sparse-checkout: openvts-custom-llm.patch
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Check out the supplied source revision
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          ref: f4f9b8838f65b106cfafadc0f622f0c72d82beef
+          path: source
+          lfs: true
+          persist-credentials: false
+
+      - name: Apply custom LLM source changes
+        run: |
+          git apply --check ../recipe/openvts-custom-llm.patch
+          if ($LASTEXITCODE -ne 0) { throw 'Source patch does not match the pinned revision' }
+          git apply ../recipe/openvts-custom-llm.patch
+          if ($LASTEXITCODE -ne 0) { throw 'Source patch failed' }
+
+      - name: Configure compiler dependencies
+        timeout-minutes: 5
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git config --global core.longpaths true
+          'C:\Program Files\Git\usr\bin' >> $env:GITHUB_PATH
+          'C:\Program Files\LLVM\bin' >> $env:GITHUB_PATH
+          'C:\Program Files (x86)\Inno Setup 6' >> $env:GITHUB_PATH
+          if (-not (Get-Command protoc -ErrorAction SilentlyContinue)) {
+            choco install protoc --yes --no-progress
+            if ($LASTEXITCODE -ne 0) { throw 'protoc installation failed' }
+          }
+          rustup toolchain install 1.92.0 --profile minimal --component clippy,rustfmt
+          if ($LASTEXITCODE -ne 0) { throw 'Rust installation failed' }
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          key: openvts-windows-msvc
+          workspaces: |
+            source -> target
+            source/openvts/adapter -> target
+          cache-on-failure: true
+
+      - name: Test, compile and create installer
+        timeout-minutes: 24
+        run: ./openvts/build-windows.ps1 -Installer -TimeoutMinutes 23
+
+      - name: Verify installer and installed executable
+        timeout-minutes: 2
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $install = Join-Path $env:RUNNER_TEMP 'OpenVTSInstallCheck'
+          $setup = Start-Process -FilePath ./dist/OpenVTSTerminalSetup.exe -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', ('/DIR="' + $install + '"')) -PassThru
+          if (-not $setup.WaitForExit(60000)) { taskkill /PID $setup.Id /T /F; throw 'Installer check timed out' }
+          if ($setup.ExitCode -ne 0) { throw 'Installer check failed' }
+          foreach ($file in @('OpenVTSTerminal.exe', 'openvts-llm.json', 'Start-OpenVTS.cmd', 'conpty.dll', 'x64\OpenConsole.exe', 'resources\settings_schema.json')) {
+            if (-not (Test-Path (Join-Path $install $file))) { throw "Installed file is missing: $file" }
+          }
+          $schema = Join-Path $env:RUNNER_TEMP 'openvts-installed-schema.json'
+          $app = Start-Process -FilePath (Join-Path $install 'OpenVTSTerminal.exe') -ArgumentList @('dump-settings-schema', ('"' + $schema + '"')) -PassThru
+          if (-not $app.WaitForExit(30000)) { taskkill /PID $app.Id /T /F; throw 'Installed application check timed out' }
+          if ($app.ExitCode -ne 0 -or -not (Test-Path $schema)) { throw 'Installed application did not produce a settings schema' }
+          Get-Content $schema -Raw | ConvertFrom-Json | Out-Null
+
+      - name: Archive the exact source used for this build
+        timeout-minutes: 2
+        run: |
+          @'
+          from pathlib import Path
+          from zipfile import ZipFile, ZIP_DEFLATED
+          root = Path.cwd()
+          with ZipFile(root / 'dist' / 'OpenVTSTerminal-source.zip', 'w', ZIP_DEFLATED) as archive:
+              for item in root.rglob('*'):
+                  rel = item.relative_to(root)
+                  if any(part in {'.git', 'target', 'dist', 'build-logs'} for part in rel.parts):
+                      continue
+                  if item.is_file():
+                      archive.write(item, str(Path('OpenVTSTerminal-source') / rel))
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw 'Source archive failed' }
+
+      - name: Upload completed installer and portable package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: OpenVTSTerminal-Windows-x64
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            source/dist/OpenVTSTerminalSetup.exe
+            source/dist/OpenVTSTerminalSetup.exe.sha256
+            source/dist/OpenVTSTerminal-*.zip
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: OpenVTSTerminal-build-logs
+          if-no-files-found: ignore
+          retention-days: 7
+          path: source/build-logs/
