@@ -861,7 +861,7 @@ diff --git a/openvts/build-windows.ps1 b/openvts/build-windows.ps1
 new file mode 100644
 --- /dev/null
 +++ b/openvts/build-windows.ps1
-@@ -0,0 +1,22 @@
+@@ -0,0 +1,34 @@
 +param(
 +    [ValidateRange(1, 30)][int]$TimeoutMinutes = 30,
 +    [switch]$Installer
@@ -876,13 +876,25 @@ new file mode 100644
 +$workerArguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $worker + '"'))
 +if ($Installer) { $workerArguments += '-Installer' }
 +$process = Start-Process powershell.exe -ArgumentList $workerArguments -WorkingDirectory $root -PassThru -NoNewWindow -RedirectStandardOutput (Join-Path $logs 'stdout.log') -RedirectStandardError (Join-Path $logs 'stderr.log')
-+if (-not $process.WaitForExit($TimeoutMinutes * 60000)) {
-+    & taskkill.exe /PID $process.Id /T /F | Out-Null
-+    throw "Build stopped after $TimeoutMinutes minutes. Check dist for any earlier completed files; this run did not complete. Cached compilation can be reused on a later run."
++$shown = @{ 'stdout.log' = 0; 'stderr.log' = 0 }
++function Publish-BuildOutput {
++    foreach ($name in @('stdout.log', 'stderr.log')) {
++        $lines = @(Get-Content (Join-Path $logs $name) -ErrorAction SilentlyContinue)
++        for ($index = $shown[$name]; $index -lt $lines.Count; $index++) { Write-Host $lines[$index] }
++        $shown[$name] = $lines.Count
++    }
++}
++$deadline = [DateTime]::UtcNow.AddMinutes($TimeoutMinutes)
++while (-not $process.WaitForExit(1000)) {
++    if ([DateTime]::UtcNow -ge $deadline) {
++        & taskkill.exe /PID $process.Id /T /F | Out-Null
++        Publish-BuildOutput
++        throw "Build stopped after $TimeoutMinutes minutes. This run did not complete; retained compilation can be reused on a later run."
++    }
++    Publish-BuildOutput
 +}
 +$process.WaitForExit()
-+Get-Content (Join-Path $logs 'stdout.log') -Tail 80 -ErrorAction SilentlyContinue
-+Get-Content (Join-Path $logs 'stderr.log') -Tail 100 -ErrorAction SilentlyContinue
++Publish-BuildOutput
 +if ($process.ExitCode -ne 0) { throw "Build failed with exit code $($process.ExitCode). See build-logs." }
 diff --git a/openvts/build-worker.ps1 b/openvts/build-worker.ps1
 new file mode 100644
@@ -1015,7 +1027,7 @@ diff --git a/.github/workflows/openvts-windows.yml b/.github/workflows/openvts-w
 new file mode 100644
 --- /dev/null
 +++ b/.github/workflows/openvts-windows.yml
-@@ -0,0 +1,99 @@
+@@ -0,0 +1,100 @@
 +name: Build Open VTS Windows installer
 +
 +on:
@@ -1074,6 +1086,7 @@ new file mode 100644
 +            . -> target
 +            openvts/adapter -> target
 +          cache-on-failure: true
++          cache-workspace-crates: true
 +
 +      - name: Test, compile and create installer
 +        timeout-minutes: 24
