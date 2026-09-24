@@ -67,6 +67,7 @@ jobs:
             source -> target
             source/openvts/adapter -> target
           cache-on-failure: true
+          cache-workspace-crates: true
 
       - name: Test, compile and create installer
         timeout-minutes: 24
