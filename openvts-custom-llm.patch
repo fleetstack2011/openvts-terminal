@@ -379,7 +379,7 @@ diff --git a/openvts/adapter/Cargo.toml b/openvts/adapter/Cargo.toml
 new file mode 100644
 --- /dev/null
 +++ b/openvts/adapter/Cargo.toml
-@@ -0,0 +1,22 @@
+@@ -0,0 +1,23 @@
 +[package]
 +name = "openvts_llm"
 +version = "0.1.0"
@@ -401,6 +401,7 @@ new file mode 100644
 +warp_multi_agent_api = { git = "https://github.com/warpdotdev/warp-proto-apis.git", rev = "f5c1878026bc11f429260c5e798e7bab6ed4e118" }
 +
 +[dev-dependencies]
++instant = "0.1"
 +tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 diff --git a/openvts/adapter/src/lib.rs b/openvts/adapter/src/lib.rs
 new file mode 100644
@@ -797,12 +798,12 @@ new file mode 100644
 +    listener.set_nonblocking(true).unwrap();
 +    let endpoint = format!("http://{}/v1/chat/completions", listener.local_addr().unwrap());
 +    let server = std::thread::spawn(move || {
-+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
++        let deadline = instant::Instant::now() + Duration::from_secs(10);
 +        let mut socket = loop {
 +            match listener.accept() {
 +                Ok((socket, _)) => break socket,
 +                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-+                    assert!(std::time::Instant::now() < deadline, "No test request received");
++                    assert!(instant::Instant::now() < deadline, "No test request received");
 +                    std::thread::sleep(Duration::from_millis(10));
 +                }
 +                Err(error) => panic!("Test listener failed: {error}"),
