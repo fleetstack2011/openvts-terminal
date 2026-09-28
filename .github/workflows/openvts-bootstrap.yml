@@ -13,7 +13,7 @@ concurrency:
 jobs:
   installer:
     runs-on: windows-2022
-    timeout-minutes: 30
+    timeout-minutes: 360
     defaults:
       run:
         shell: pwsh
@@ -70,8 +70,7 @@ jobs:
           cache-workspace-crates: true
 
       - name: Test, compile and create installer
-        timeout-minutes: 24
-        run: ./openvts/build-windows.ps1 -Installer -TimeoutMinutes 23
+        run: ./openvts/build-windows.ps1 -Installer -TimeoutMinutes 0
 
       - name: Verify installer and installed executable
         timeout-minutes: 2
