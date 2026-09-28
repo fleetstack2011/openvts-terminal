@@ -45,7 +45,7 @@ new file mode 100644
 +1. Install Visual Studio 2022 Build Tools with Desktop development with C++, the Windows SDK, Rust/rustup, Git, CMake, LLVM/Clang and Protocol Buffers (`protoc`). Rust 1.92.0 is selected by this repository. See the original `script/windows/bootstrap.ps1` and project build documentation for platform prerequisites.
 +2. Open a Developer PowerShell for VS 2022. Ensure `cargo`, `rustup`, `git`, `cmake` and `protoc` are on PATH. Set `LIBCLANG_PATH` to your LLVM bin directory if necessary.
 +3. Run `BUILD-WINDOWS.cmd` from the extracted source. Logs are written to `build-logs/stdout.log` and `build-logs/stderr.log`.
-+4. The wrapper enforces a **30-minute limit on the entire worker process and its child processes**, including tests, downloads, compilation and packaging. It stops the process tree on timeout. This large codebase may require another run using the retained compilation cache. No automatic retry is performed.
++4. Local builds default to a **30-minute limit on the entire worker process and its child processes**. Pass `-TimeoutMinutes 0` to disable that limit. CI uses this option so large compilations can finish; GitHub's runner job limit still applies. A timed-out local build retains its compilation cache for another run.
 +5. On success, `dist/OpenVTSTerminal-<timestamp>.zip` contains `OpenVTSTerminal.exe`, required runtime DLLs, OpenConsole, resources, configuration, launch scripts and licenses. Keep the whole directory together; the EXE alone is not the complete distribution.
 +
 +The script first runs the adapter tests and Clippy, then compiles the actual Warp application with `openvts,gui,release_bundle`. Dependency resolution updates the root lockfile to include the new local adapter; review and retain the resolved lockfiles after the first successful build. No dependencies were silently upgraded in the delivered original lockfile. The build is unsigned. With Inno Setup 6 installed, run `BUILD-WINDOWS.cmd -Installer` to also produce `dist/OpenVTSTerminalSetup.exe`.
@@ -76,7 +76,7 @@ new file mode 100644
 +
 +`.github/workflows/openvts-windows.yml` prepares a Windows Server 2022 runner, runs the targeted adapter tests and Clippy, compiles the application, creates an Inno Setup installer, and checks a silent installation plus settings-schema generation from the installed binary. It uploads completed installer/portable artifacts only after those checks pass. A real GPU session and a live authenticated LLM request still need verification.
 +
-+The workflow has a 30-minute job limit; its build subprocess is stopped after 23 minutes so logs can still be uploaded. Compilation caches are retained when possible. No LLM token or signing certificate is required to build. The build recipe is in `fleetstack2011/openvts-terminal`. Its bootstrap workflow checks out the exact uploaded Warp revision and applies `openvts-custom-llm.patch`. The resulting source ZIP contains the actual modified files. The standalone workflow in this source ZIP can be started from the Actions tab after committing this source to a repository. It creates workflow artifacts, not a public release.
++The workflow disables the build subprocess timeout and allows GitHub's maximum six-hour runner job duration. Compilation caches are retained when possible. No LLM token or signing certificate is required to build. The build recipe is in `fleetstack2011/openvts-terminal`. Its bootstrap workflow checks out the exact uploaded Warp revision and applies `openvts-custom-llm.patch`. The resulting source ZIP contains the actual modified files. The standalone workflow in this source ZIP can be started from the Actions tab after committing this source to a repository. It creates workflow artifacts, not a public release.
 diff --git a/app/Cargo.toml b/app/Cargo.toml
 --- a/app/Cargo.toml
 +++ b/app/Cargo.toml
@@ -862,9 +862,9 @@ diff --git a/openvts/build-windows.ps1 b/openvts/build-windows.ps1
 new file mode 100644
 --- /dev/null
 +++ b/openvts/build-windows.ps1
-@@ -0,0 +1,34 @@
+@@ -0,0 +1,35 @@
 +param(
-+    [ValidateRange(1, 30)][int]$TimeoutMinutes = 30,
++    [ValidateRange(0, 30)][int]$TimeoutMinutes = 30,
 +    [switch]$Installer
 +)
 +$ErrorActionPreference = 'Stop'
@@ -872,7 +872,8 @@ new file mode 100644
 +$logs = Join-Path $root 'build-logs'
 +New-Item -ItemType Directory -Force -Path $logs | Out-Null
 +$worker = Join-Path $PSScriptRoot 'build-worker.ps1'
-+Write-Host "Building Open VTS Terminal. Hard timeout: $TimeoutMinutes minutes for the entire build."
++if ($TimeoutMinutes -eq 0) { Write-Host 'Building Open VTS Terminal. Build timeout disabled.' }
++else { Write-Host "Building Open VTS Terminal. Hard timeout: $TimeoutMinutes minutes for the entire build." }
 +Write-Host "Logs: $logs"
 +$workerArguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $worker + '"'))
 +if ($Installer) { $workerArguments += '-Installer' }
@@ -887,7 +888,7 @@ new file mode 100644
 +}
 +$deadline = [DateTime]::UtcNow.AddMinutes($TimeoutMinutes)
 +while (-not $process.WaitForExit(1000)) {
-+    if ([DateTime]::UtcNow -ge $deadline) {
++    if ($TimeoutMinutes -gt 0 -and [DateTime]::UtcNow -ge $deadline) {
 +        & taskkill.exe /PID $process.Id /T /F | Out-Null
 +        Publish-BuildOutput
 +        throw "Build stopped after $TimeoutMinutes minutes. This run did not complete; retained compilation can be reused on a later run."
@@ -1028,7 +1029,7 @@ diff --git a/.github/workflows/openvts-windows.yml b/.github/workflows/openvts-w
 new file mode 100644
 --- /dev/null
 +++ b/.github/workflows/openvts-windows.yml
-@@ -0,0 +1,100 @@
+@@ -0,0 +1,99 @@
 +name: Build Open VTS Windows installer
 +
 +on:
@@ -1051,7 +1052,7 @@ new file mode 100644
 +jobs:
 +  installer:
 +    runs-on: windows-2022
-+    timeout-minutes: 30
++    timeout-minutes: 360
 +    defaults:
 +      run:
 +        shell: pwsh
@@ -1090,8 +1091,7 @@ new file mode 100644
 +          cache-workspace-crates: true
 +
 +      - name: Test, compile and create installer
-+        timeout-minutes: 24
-+        run: ./openvts/build-windows.ps1 -Installer -TimeoutMinutes 23
++        run: ./openvts/build-windows.ps1 -Installer -TimeoutMinutes 0
 +
 +      - name: Verify installer and installed executable
 +        timeout-minutes: 2
